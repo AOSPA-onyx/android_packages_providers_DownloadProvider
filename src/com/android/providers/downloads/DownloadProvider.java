@@ -21,8 +21,12 @@ import static android.os.Binder.getCallingUid;
 import static android.provider.BaseColumns._ID;
 import static android.provider.Downloads.Impl.COLUMN_DESTINATION;
 import static android.provider.Downloads.Impl.COLUMN_IS_VISIBLE_IN_DOWNLOADS_UI;
+import static android.provider.Downloads.Impl.COLUMN_MEDIA_SCANNED;
 import static android.provider.Downloads.Impl.COLUMN_OTHER_UID;
 import static android.provider.Downloads.Impl.DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD;
+import static android.provider.Downloads.Impl.MEDIA_NOT_SCANNABLE;
+import static android.provider.Downloads.Impl.MEDIA_NOT_SCANNED;
+import static android.provider.Downloads.Impl.MEDIA_SCANNED;
 import static android.provider.Downloads.Impl.PERMISSION_ACCESS_ALL;
 
 import android.annotation.NonNull;
@@ -49,6 +53,7 @@ import android.database.sqlite.SQLiteOpenHelper;
 import android.database.sqlite.SQLiteQueryBuilder;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.os.ParcelFileDescriptor.OnCloseListener;
 import android.os.Process;
@@ -62,7 +67,10 @@ import android.provider.MediaStore.Files;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.text.format.DateUtils;
+import android.util.ArrayMap;
 import android.util.Log;
+import android.util.LongArray;
+import android.util.LongSparseArray;
 
 import com.android.internal.util.IndentingPrintWriter;
 
@@ -378,12 +386,13 @@ public final class DownloadProvider extends ContentProvider {
                 final DownloadInfo.Reader reader
                         = new DownloadInfo.Reader(getContext().getContentResolver(), cursor);
                 final DownloadInfo info = new DownloadInfo(getContext());
+                final ContentValues updateValues = new ContentValues();
                 while (cursor.moveToNext()) {
                     reader.updateFromDatabase(info);
                     final Uri mediaStoreUri = updateMediaProvider(client, null,
                             convertToMediaProviderValues(info));
                     if (mediaStoreUri != null) {
-                        final ContentValues updateValues = new ContentValues();
+                        updateValues.clear();
                         updateValues.put(Downloads.Impl.COLUMN_MEDIASTORE_URI,
                                 mediaStoreUri.toString());
                         db.update(DB_TABLE, updateValues, Downloads.Impl._ID + "=?",
@@ -552,6 +561,22 @@ public final class DownloadProvider extends ContentProvider {
         }
     }
 
+    @Override
+    public Bundle call(String method, String arg, Bundle extras) {
+        if (method == Downloads.MEDIASTORE_DOWNLOADS_DELETED_CALL) {
+            getContext().enforceCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_MEDIA_STORAGE,
+                    "Not allowed to call " + Downloads.MEDIASTORE_DOWNLOADS_DELETED_CALL);
+            final long[] deletedDownloadIds = extras.getLongArray(Downloads.EXTRA_IDS);
+            final String[] mimeTypes = extras.getStringArray(Downloads.EXTRA_MIME_TYPES);
+            DownloadStorageProvider.onMediaProviderDownloadsDelete(getContext(),
+                    deletedDownloadIds, mimeTypes);
+            return null;
+        } else {
+            throw new UnsupportedOperationException("Unsupported call: " + method);
+        }
+    }
+
     /**
      * Inserts a row in the database
      */
@@ -650,7 +675,6 @@ public final class DownloadProvider extends ContentProvider {
             filteredValues.put(Downloads.Impl.COLUMN_TOTAL_BYTES,
                     values.getAsLong(Downloads.Impl.COLUMN_TOTAL_BYTES));
             filteredValues.put(Downloads.Impl.COLUMN_CURRENT_BYTES, 0);
-            copyInteger(Downloads.Impl.COLUMN_MEDIA_SCANNED, values, filteredValues);
             copyString(Downloads.Impl._DATA, values, filteredValues);
             copyBoolean(Downloads.Impl.COLUMN_ALLOW_WRITE, values, filteredValues);
         } else {
@@ -717,6 +741,32 @@ public final class DownloadProvider extends ContentProvider {
             copyInteger(Downloads.Impl.COLUMN_FLAGS, values, filteredValues);
         }
 
+        final Integer mediaScanned = values.getAsInteger(Downloads.Impl.COLUMN_MEDIA_SCANNED);
+        filteredValues.put(COLUMN_MEDIA_SCANNED,
+                mediaScanned == null ? MEDIA_NOT_SCANNED : mediaScanned);
+
+        final boolean shouldBeVisibleToUser
+                = filteredValues.getAsBoolean(COLUMN_IS_VISIBLE_IN_DOWNLOADS_UI)
+                        || filteredValues.getAsInteger(COLUMN_MEDIA_SCANNED) == MEDIA_NOT_SCANNED;
+        if (shouldBeVisibleToUser && filteredValues.getAsInteger(COLUMN_DESTINATION)
+                == DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD) {
+            final CallingIdentity token = clearCallingIdentity();
+            try (ContentProviderClient client = getContext().getContentResolver()
+                    .acquireContentProviderClient(MediaStore.AUTHORITY)) {
+                final Uri mediaStoreUri = updateMediaProvider(client, null,
+                        convertToMediaProviderValues(filteredValues));
+                if (mediaStoreUri != null) {
+                    filteredValues.put(Downloads.Impl.COLUMN_MEDIASTORE_URI,
+                            mediaStoreUri.toString());
+                    filteredValues.put(Downloads.Impl.COLUMN_MEDIAPROVIDER_URI,
+                            mediaStoreUri.toString());
+                    filteredValues.put(COLUMN_MEDIA_SCANNED, MEDIA_SCANNED);
+                }
+            } finally {
+                restoreCallingIdentity(token);
+            }
+        }
+
         if (Constants.LOGVV) {
             Log.v(Constants.TAG, "initiating download with UID "
                     + filteredValues.getAsInteger(Constants.UID));
@@ -726,23 +776,6 @@ public final class DownloadProvider extends ContentProvider {
             }
         }
 
-        if (values.getAsInteger(COLUMN_DESTINATION) == DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD
-                && values.getAsBoolean(COLUMN_IS_VISIBLE_IN_DOWNLOADS_UI)) {
-            final CallingIdentity token = clearCallingIdentity();
-            try (ContentProviderClient client = getContext().getContentResolver()
-                    .acquireContentProviderClient(MediaStore.AUTHORITY)) {
-                final Uri mediaStoreUri = updateMediaProvider(client, null,
-                        convertToMediaProviderValues(filteredValues));
-                if (mediaStoreUri != null) {
-                    filteredValues.put(Downloads.Impl.COLUMN_MEDIAPROVIDER_URI,
-                            mediaStoreUri.toString());
-                    filteredValues.put(Downloads.Impl.COLUMN_MEDIASTORE_URI,
-                            mediaStoreUri.toString());
-                }
-            } finally {
-                restoreCallingIdentity(token);
-            }
-        }
         long rowID = db.insert(DB_TABLE, null, filteredValues);
         if (rowID == -1) {
             Log.d(Constants.TAG, "couldn't insert into downloads database");
@@ -806,6 +839,7 @@ public final class DownloadProvider extends ContentProvider {
                 return isVisibleInDownloads ? mediaStoreUri : null;
             }
         } catch (RemoteException e) {
+            // Should not happen
         }
         return null;
     }
@@ -826,6 +860,7 @@ public final class DownloadProvider extends ContentProvider {
                 return ContentUris.withAppendedId(filesUri, cursor.getLong(0));
             }
         } catch (RemoteException e) {
+            // Should not happen
         }
         return null;
     }
@@ -841,7 +876,7 @@ public final class DownloadProvider extends ContentProvider {
         mediaValues.put(MediaStore.Downloads.MIME_TYPE, info.mMimeType);
         mediaValues.put(MediaStore.Downloads.IS_PENDING,
                 Downloads.Impl.isStatusSuccess(info.mStatus) ? 0 : 1);
-        mediaValues.put(Files.FileColumns.IS_DOWNLOAD, info.mIsVisibleInDownloadsUi ? 1 : 0);
+        mediaValues.put(Files.FileColumns.IS_DOWNLOAD, 1);
         return mediaValues;
     }
 
@@ -1138,13 +1173,100 @@ public final class DownloadProvider extends ContentProvider {
 
         final SQLiteQueryBuilder qb = getQueryBuilder(uri, match);
 
+        // map of volumeName -> { mediastore ids that need to be queried }
+        final ArrayMap<String, LongArray> mediaStoreIdsForVolumes = new ArrayMap<>();
+        try (Cursor cursor = qb.query(db, new String[] { Downloads.Impl.COLUMN_MEDIASTORE_URI },
+                selection, selectionArgs, null, null, sort)) {
+            while (cursor.moveToNext()) {
+                final String uriString = cursor.getString(0);
+                if (uriString == null) {
+                    continue;
+                }
+                final Uri mediaStoreUri = Uri.parse(uriString);
+                final String volumeName = MediaStore.getVolumeName(mediaStoreUri);
+                LongArray ids = mediaStoreIdsForVolumes.get(volumeName);
+                if (ids == null) {
+                    ids = new LongArray();
+                    mediaStoreIdsForVolumes.put(volumeName, ids);
+                }
+                ids.add(ContentUris.parseId(mediaStoreUri));
+            }
+        }
+        // map of volumeName -> { map of {mediastore id -> mediastore data} }
+        final ArrayMap<String, LongSparseArray<MediaStoreData>> mediaStoreDataForVolumes
+                = new ArrayMap<>();
+        final CallingIdentity token = clearCallingIdentity();
+        try (ContentProviderClient client = getContext().getContentResolver()
+                .acquireContentProviderClient(MediaStore.AUTHORITY)) {
+            final String[] projectionIn = new String[] {
+                    MediaStore.Downloads._ID,
+                    MediaStore.Downloads.DISPLAY_NAME,
+                    MediaStore.Downloads.DATA,
+            };
+            for (int i = 0; i < mediaStoreIdsForVolumes.size(); ++i) {
+                final String volumeName = mediaStoreIdsForVolumes.keyAt(i);
+                final LongArray ids = mediaStoreIdsForVolumes.valueAt(i);
+                final LongSparseArray<MediaStoreData> mediaStoreDataForIds
+                        = new LongSparseArray<>();
+                mediaStoreDataForVolumes.put(volumeName, mediaStoreDataForIds);
+                try (Cursor mediaCursor = getMediaProviderRowsForIds(
+                        client, projectionIn, volumeName, ids)) {
+                    while (mediaCursor.moveToNext()) {
+                        final long id = mediaCursor.getLong(0);
+                        final String displayName = mediaCursor.getString(1);
+                        final String filePath = mediaCursor.getString(2);
+                        mediaStoreDataForIds.put(id, new MediaStoreData(displayName, filePath));
+                    }
+                }
+            }
+        } catch (RemoteException e) {
+            // Should not happen
+        } finally {
+            restoreCallingIdentity(token);
+        }
+
         final int pid = Binder.getCallingPid();
         final int uid = Binder.getCallingUid();
         final TranslatingCursor.Config config = getTranslatingCursorConfig(match);
         final TranslatingCursor.Translator translator
-                = (data, id) -> translateSystemToApp(data, pid, uid);
-        final Cursor ret = TranslatingCursor.query(config, translator, qb, db,
-                projection, selection, selectionArgs, null, null, sort, null, null);
+                = (data, auxiliaryColIndex, matchingColumn, cursor) -> {
+            final String uriString = cursor.getString(auxiliaryColIndex);
+            if (uriString != null) {
+                final Uri mediaStoreUri = Uri.parse(uriString);
+                final String volumeName = MediaStore.getVolumeName(mediaStoreUri);
+                final LongSparseArray<MediaStoreData> mediaStoreDataForIds
+                        = mediaStoreDataForVolumes.get(volumeName);
+                if (mediaStoreDataForIds != null) {
+                    final long id = ContentUris.parseId(mediaStoreUri);
+                    final MediaStoreData mediaStoreData = mediaStoreDataForIds.get(id);
+                    if (mediaStoreData != null) {
+                        switch (matchingColumn) {
+                            case Downloads.Impl.COLUMN_TITLE:
+                                data = mediaStoreData.displayName;
+                                break;
+                            case Downloads.Impl._DATA:
+                            case Downloads.Impl.COLUMN_FILE_NAME_HINT:
+                            case DownloadManager.COLUMN_LOCAL_FILENAME:
+                                data = mediaStoreData.filePath;
+                                break;
+                            default:
+                                return data;
+                        }
+                    }
+                }
+            }
+
+            switch (matchingColumn) {
+                case Downloads.Impl._DATA:
+                case Downloads.Impl.COLUMN_FILE_NAME_HINT:
+                case DownloadManager.COLUMN_LOCAL_FILENAME:
+                    return translateSystemToApp(data, pid, uid);
+                default:
+                    return data;
+            }
+        };
+        final Cursor ret = TranslatingCursor.query(config, translator,
+                qb, db, projection, selection, selectionArgs, null, null, sort, null, null);
 
         if (ret != null) {
             ret.setNotificationUri(getContext().getContentResolver(), uri);
@@ -1161,6 +1283,19 @@ public final class DownloadProvider extends ContentProvider {
         return ret;
     }
 
+    private Cursor getMediaProviderRowsForIds(ContentProviderClient mediaProvider,
+            String[] projection, String volumeName, LongArray ids) throws RemoteException {
+        final StringBuilder queryString = new StringBuilder();
+        queryString.append(MediaStore.Downloads._ID + " in (");
+        final int size = ids.size();
+        for (int i = 0; i < size; ++i) {
+            queryString.append(ids.get(i));
+            queryString.append((i == size - 1) ? ")" : ",");
+        }
+        return mediaProvider.query(MediaStore.Downloads.getContentUri(volumeName),
+                projection, queryString.toString(), null, null);
+    }
+
     private TranslatingCursor.Config getTranslatingCursorConfig(int match) {
         final Uri baseUri;
         switch (match) {
@@ -1175,9 +1310,11 @@ public final class DownloadProvider extends ContentProvider {
             default:
                 baseUri = null;
         }
-        return new TranslatingCursor.Config(baseUri,
-                Downloads.Impl._ID, Downloads.Impl._DATA, Downloads.Impl.COLUMN_FILE_NAME_HINT,
-                DownloadManager.COLUMN_LOCAL_FILENAME);
+        return new TranslatingCursor.Config(baseUri, Downloads.Impl.COLUMN_MEDIASTORE_URI,
+                Downloads.Impl._DATA,
+                Downloads.Impl.COLUMN_FILE_NAME_HINT,
+                DownloadManager.COLUMN_LOCAL_FILENAME,
+                Downloads.Impl.COLUMN_TITLE);
     }
 
     private void logVerboseQueryInfo(String[] projection, final String selection,
@@ -1345,33 +1482,42 @@ public final class DownloadProvider extends ContentProvider {
                     final DownloadInfo.Reader reader = new DownloadInfo.Reader(resolver,
                             cursor);
                     final DownloadInfo info = new DownloadInfo(context);
+                    final ContentValues updateValues = new ContentValues();
                     while (cursor.moveToNext()) {
                         reader.updateFromDatabase(info);
+                        final boolean visibleToUser = info.mIsVisibleInDownloadsUi
+                                || (info.mMediaScanned != MEDIA_NOT_SCANNABLE);
                         if (info.mFileName == null) {
                             if (info.mMediaStoreUri != null) {
                                 client.delete(Uri.parse(info.mMediaStoreUri), null, null);
+                                updateValues.clear();
+                                updateValues.putNull(Downloads.Impl.COLUMN_MEDIASTORE_URI);
+                                qb.update(db, updateValues, Downloads.Impl._ID + "=?",
+                                        new String[] { Long.toString(info.mId) });
                             }
-                            final ContentValues updateValues = new ContentValues();
-                            updateValues.putNull(Downloads.Impl.COLUMN_MEDIASTORE_URI);
-                            qb.update(db, updateValues, Downloads.Impl._ID + "=?",
-                                    new String[] { Long.toString(info.mId) });
-                        } else if (info.mDestination == Downloads.Impl.DESTINATION_EXTERNAL
+                        } else if ((info.mDestination == Downloads.Impl.DESTINATION_EXTERNAL
                                 || info.mDestination == Downloads.Impl.DESTINATION_FILE_URI
                                 || info.mDestination == Downloads.Impl
-                                        .DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD) {
+                                        .DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD)
+                                && visibleToUser) {
                             final Uri mediaStoreUri = updateMediaProvider(client,
                                     info.mMediaStoreUri, convertToMediaProviderValues(info));
                             if (!TextUtils.equals(info.mMediaStoreUri,
                                     mediaStoreUri == null ? null : mediaStoreUri.toString())) {
-                                final ContentValues updateValues = new ContentValues();
+                                updateValues.clear();
                                 if (mediaStoreUri == null) {
                                     updateValues.putNull(Downloads.Impl.COLUMN_MEDIASTORE_URI);
+                                    updateValues.putNull(Downloads.Impl.COLUMN_MEDIAPROVIDER_URI);
+                                    updateValues.put(COLUMN_MEDIA_SCANNED, MEDIA_NOT_SCANNED);
                                 } else {
                                     updateValues.put(Downloads.Impl.COLUMN_MEDIASTORE_URI,
                                             mediaStoreUri.toString());
+                                    updateValues.put(Downloads.Impl.COLUMN_MEDIAPROVIDER_URI,
+                                            mediaStoreUri.toString());
+                                    updateValues.put(COLUMN_MEDIA_SCANNED, MEDIA_SCANNED);
                                 }
                                 qb.update(db, updateValues, Downloads.Impl._ID + "=?",
-                                        new String[]{Long.toString(info.mId)});
+                                        new String[] { Long.toString(info.mId) });
                             }
                         }
                         if (updateSchedule) {
@@ -1612,7 +1758,7 @@ public final class DownloadProvider extends ContentProvider {
                         destination == Downloads.Impl.DESTINATION_EXTERNAL
                         || destination == Downloads.Impl.DESTINATION_FILE_URI
                         || destination == Downloads.Impl.DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD)
-                        && mediaScanned != 2;
+                        && mediaScanned != Downloads.Impl.MEDIA_NOT_SCANNABLE;
             } else {
                 throw new FileNotFoundException("Failed moveToFirst");
             }
@@ -1778,5 +1924,15 @@ public final class DownloadProvider extends ContentProvider {
     private void revokeAllDownloadsPermission(long id) {
         final Uri uri = ContentUris.withAppendedId(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, id);
         getContext().revokeUriPermission(uri, ~0);
+    }
+
+    private static final class MediaStoreData {
+        public String displayName;
+        public String filePath;
+
+        public MediaStoreData(String displayName, String filePath) {
+            this.displayName = displayName;
+            this.filePath = filePath;
+        }
     }
 }
