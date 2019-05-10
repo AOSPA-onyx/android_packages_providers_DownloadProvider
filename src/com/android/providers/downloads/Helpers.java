@@ -16,10 +16,12 @@
 
 package com.android.providers.downloads;
 
+import static android.os.Environment.buildExternalStorageAndroidDataDirs;
 import static android.os.Environment.buildExternalStorageAppCacheDirs;
-import static android.os.Environment.buildExternalStorageAppFilesDirs;
+import static android.os.Environment.buildExternalStorageAppDataDirs;
 import static android.os.Environment.buildExternalStorageAppMediaDirs;
 import static android.os.Environment.buildExternalStorageAppObbDirs;
+import static android.os.Environment.buildExternalStoragePublicDirs;
 import static android.provider.Downloads.Impl.FLAG_REQUIRES_CHARGING;
 import static android.provider.Downloads.Impl.FLAG_REQUIRES_DEVICE_IDLE;
 
@@ -63,6 +65,9 @@ public class Helpers {
     /** Regex used to parse content-disposition headers */
     private static final Pattern CONTENT_DISPOSITION_PATTERN =
             Pattern.compile("attachment;\\s*filename\\s*=\\s*\"([^\"]*)\"");
+
+    private static final Pattern PATTERN_ANDROID_DIRS =
+            Pattern.compile("(?i)^/storage/[^/]+(?:/[0-9]+)?/Android/(?:data|obb|media)/.+");
 
     private static final Object sUniqueLock = new Object();
 
@@ -472,6 +477,10 @@ public class Helpers {
         throw new IOException("Failed to generate an available filename");
     }
 
+    public static boolean isFileInExternalAndroidDirs(String filePath) {
+        return PATTERN_ANDROID_DIRS.matcher(filePath).matches();
+    }
+
     static boolean isFilenameValid(Context context, File file) {
         return isFilenameValid(context, file, true);
     }
@@ -488,10 +497,24 @@ public class Helpers {
     static boolean isFilenameValidInExternalPackage(Context context, File file,
             String packageName) {
         try {
-            if (containsCanonical(buildExternalStorageAppFilesDirs(packageName), file) ||
+            if (containsCanonical(buildExternalStorageAppDataDirs(packageName), file) ||
                     containsCanonical(buildExternalStorageAppObbDirs(packageName), file) ||
-                    containsCanonical(buildExternalStorageAppCacheDirs(packageName), file) ||
                     containsCanonical(buildExternalStorageAppMediaDirs(packageName), file)) {
+                return true;
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to resolve canonical path: " + e);
+            return false;
+        }
+
+        Log.w(TAG, "Path appears to be invalid: " + file);
+        return false;
+    }
+
+    static boolean isFilenameValidInPublicDownloadsDir(File file) {
+        try {
+            if (containsCanonical(buildExternalStoragePublicDirs(
+                    Environment.DIRECTORY_DOWNLOADS), file)) {
                 return true;
             }
         } catch (IOException e) {
